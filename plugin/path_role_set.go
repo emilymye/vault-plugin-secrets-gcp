@@ -61,61 +61,6 @@ func pathRoleSet(b *backend) *framework.Path {
 	}
 }
 
-func pathRoleSetList(b *backend) *framework.Path {
-	// Paths for listing role sets
-	return &framework.Path{
-		Pattern: "rolesets?/?",
-		Operations: map[logical.Operation]framework.OperationHandler{
-			logical.ListOperation: &framework.PathOperation{
-				Callback: b.pathRoleSetList,
-			},
-		},
-		HelpSynopsis:    pathListRoleSetHelpSyn,
-		HelpDescription: pathListRoleSetHelpDesc,
-	}
-}
-
-func pathRoleSetRotateAccount(b *backend) *framework.Path {
-	return &framework.Path{
-		// Path to rotate role set service accounts
-		Pattern: fmt.Sprintf("roleset/%s/rotate", framework.GenericNameRegex("name")),
-		Fields: map[string]*framework.FieldSchema{
-			"name": {
-				Type:        framework.TypeString,
-				Description: "Name of the role.",
-			},
-		},
-		ExistenceCheck: b.pathRoleSetExistenceCheck,
-		Operations: map[logical.Operation]framework.OperationHandler{
-			logical.UpdateOperation: &framework.PathOperation{
-				Callback: b.pathRoleSetRotateAccount,
-			},
-		},
-		HelpSynopsis:    pathRoleSetRotateAccountHelpSyn,
-		HelpDescription: pathRoleSetRotateAccountHelpDesc,
-	}
-}
-
-func pathRoleSetRotateKey(b *backend) *framework.Path {
-	return &framework.Path{
-		Pattern: fmt.Sprintf("roleset/%s/rotate-key", framework.GenericNameRegex("name")),
-		Fields: map[string]*framework.FieldSchema{
-			"name": {
-				Type:        framework.TypeString,
-				Description: "Name of the role.",
-			},
-		},
-		ExistenceCheck: b.pathRoleSetExistenceCheck,
-		Operations: map[logical.Operation]framework.OperationHandler{
-			logical.UpdateOperation: &framework.PathOperation{
-				Callback: b.pathRoleSetRotateKey,
-			},
-		},
-		HelpSynopsis:    pathRoleSetRotateKeyHelpSyn,
-		HelpDescription: pathRoleSetRotateKeyHelpDesc,
-	}
-}
-
 func (b *backend) pathRoleSetExistenceCheck(ctx context.Context, req *logical.Request, d *framework.FieldData) (bool, error) {
 	nameRaw, ok := d.GetOk("name")
 	if !ok {
@@ -335,81 +280,6 @@ func (b *backend) pathRoleSetCreateUpdate(ctx context.Context, req *logical.Requ
 	return nil, nil
 }
 
-func (b *backend) pathRoleSetList(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	rolesets, err := req.Storage.List(ctx, "roleset/")
-	if err != nil {
-		return nil, err
-	}
-	return logical.ListResponse(rolesets), nil
-}
-
-func (b *backend) pathRoleSetRotateAccount(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	nameRaw, ok := d.GetOk("name")
-	if !ok {
-		return logical.ErrorResponse("name is required"), nil
-	}
-	name := nameRaw.(string)
-
-	b.rolesetLock.Lock()
-	defer b.rolesetLock.Unlock()
-
-	rs, err := getRoleSet(name, ctx, req.Storage)
-	if err != nil {
-		return nil, err
-	}
-	if rs == nil {
-		return logical.ErrorResponse("roleset '%s' not found", name), nil
-	}
-
-	var scopes []string
-	if rs.TokenGen != nil {
-		scopes = rs.TokenGen.Scopes
-	}
-
-	warnings, err := b.saveRoleSetWithNewAccount(ctx, req, rs, rs.AccountId.Project, rs.Bindings, scopes)
-	if err != nil {
-		return logical.ErrorResponse(err.Error()), nil
-	} else if warnings != nil && len(warnings) > 0 {
-		return &logical.Response{Warnings: warnings}, nil
-	}
-	return nil, nil
-}
-
-func (b *backend) pathRoleSetRotateKey(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	nameRaw, ok := d.GetOk("name")
-	if !ok {
-		return logical.ErrorResponse("name is required"), nil
-	}
-	name := nameRaw.(string)
-
-	b.rolesetLock.Lock()
-	defer b.rolesetLock.Unlock()
-
-	rs, err := getRoleSet(name, ctx, req.Storage)
-	if err != nil {
-		return nil, err
-	}
-	if rs == nil {
-		return logical.ErrorResponse("roleset '%s' not found", name), nil
-	}
-
-	if rs.SecretType != SecretTypeAccessToken {
-		return logical.ErrorResponse("cannot rotate key for non-access-token role set"), nil
-	}
-	var scopes []string
-	if rs.TokenGen != nil {
-		scopes = rs.TokenGen.Scopes
-	}
-	warn, err := b.saveRoleSetWithNewTokenKey(ctx, req, rs, scopes)
-	if err != nil {
-		return logical.ErrorResponse(err.Error()), nil
-	}
-	if warn != "" {
-		return &logical.Response{Warnings: []string{warn}}, nil
-	}
-	return nil, nil
-}
-
 func getRoleSet(name string, ctx context.Context, s logical.Storage) (*RoleSet, error) {
 	entry, err := s.Get(ctx, fmt.Sprintf("%s/%s", rolesetStoragePrefix, name))
 	if err != nil {
@@ -481,21 +351,3 @@ The given resource can have the following
 	Example (Pubsub subscription):
 		projects/myproject/subscriptions/mysub
 `
-
-const pathListRoleSetHelpSyn = `List existing rolesets.`
-const pathListRoleSetHelpDesc = `List created role sets.`
-
-const pathRoleSetRotateAccountHelpSyn = `Rotates or recreates the service account bound to a roleset.`
-const pathRoleSetRotateAccountHelpDesc = `
-This path allows you to rotate (i.e. recreate) the service account used to
-generate secrets for a given role set. This will delete and recreate
-the service account, invalidating any old keys/credentials
-generated previously.
-`
-
-const pathRoleSetRotateKeyHelpSyn = `Rotate the service account key used to generate access tokens for a roleset.`
-const pathRoleSetRotateKeyHelpDesc = `
-This path allows you to rotate (i.e. recreate) the service account key 
-used to generate access tokens under a given role set. This path only
-applies to role sets that generate access tokens and will not delete
-the associated service account.`
