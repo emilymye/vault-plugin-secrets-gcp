@@ -5,16 +5,12 @@ import (
 	"fmt"
 	"github.com/hashicorp/vault/sdk/framework"
 
-	"github.com/hashicorp/errwrap"
 	"github.com/hashicorp/go-gcp-common/gcputil"
-	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/vault-plugin-secrets-gcp/plugin/iamutil"
 	"github.com/hashicorp/vault-plugin-secrets-gcp/plugin/util"
 	"github.com/hashicorp/vault/sdk/helper/useragent"
 	"github.com/hashicorp/vault/sdk/logical"
 	"github.com/mitchellh/mapstructure"
-	"google.golang.org/api/googleapi"
-	"google.golang.org/api/iam/v1"
 )
 
 const (
@@ -43,15 +39,17 @@ type walAccount struct {
 
 type walAccountKey struct {
 	RoleSet            string
+	StaticAccount      string
 	ServiceAccountName string
 	KeyName            string
 }
 
 type walIamPolicy struct {
-	RoleSet   string
-	AccountId gcputil.ServiceAccountId
-	Resource  string
-	Roles     []string
+	RoleSet       string
+	StaticAccount string
+	AccountId     gcputil.ServiceAccountId
+	Resource      string
+	Roles         []string
 }
 
 func (b *backend) serviceAccountRollback(ctx context.Context, req *logical.Request, data interface{}) error {
@@ -63,13 +61,13 @@ func (b *backend) serviceAccountRollback(ctx context.Context, req *logical.Reque
 		return err
 	}
 
-	// If account is still being used, WAL entry was not
-	// deleted properly after a successful operation.
-	// Remove WAL entry.
 	rs, err := getRoleSet(entry.RoleSet, ctx, req.Storage)
 	if err != nil {
 		return err
 	}
+
+	// If account is still being used, WAL entry was not deleted properly after a successful operation.
+	// Remove WAL entry.
 	if rs != nil && entry.Id.ResourceName() == rs.AccountId.ResourceName() {
 		// Still being used - don't delete this service account.
 		return nil
@@ -93,26 +91,46 @@ func (b *backend) serviceAccountKeyRollback(ctx context.Context, req *logical.Re
 		return err
 	}
 
-	b.Logger().Debug("checking roleset listed in WAL is access_token roleset")
-
+	b.Logger().Debug("checking parent listed in WAL generates access_token secret")
 	var keyInUse string
 
-	// Get roleset for entry
-	rs, err := getRoleSet(entry.RoleSet, ctx, req.Storage)
-	if err != nil {
-		return err
-	}
-
-	// If roleset is not nil, get key in use.
-	if rs != nil {
-		if rs.SecretType != SecretTypeAccessToken {
-			// Don't clean keys if roleset doesn't create access_tokens (i.e. creates keys).
-			return nil
+	switch {
+	case entry.RoleSet != "":
+		rs, err := getRoleSet(entry.RoleSet, ctx, req.Storage)
+		if err != nil {
+			return err
 		}
 
-		if rs.TokenGen != nil {
-			keyInUse = rs.TokenGen.KeyName
+		// If roleset is not nil, get key in use.
+		if rs != nil {
+			if rs.SecretType != SecretTypeAccessToken {
+				// Remove WAL entry - we don't clean keys if roleset generates key secrets.
+				return nil
+			}
+
+			if rs.TokenGen != nil {
+				keyInUse = rs.TokenGen.KeyName
+			}
 		}
+	case entry.StaticAccount != "":
+		sa, err := getStaticAccount(entry.StaticAccount, ctx, req.Storage)
+		if err != nil {
+			return err
+		}
+
+		// If roleset is not nil, get key in use.
+		if sa != nil {
+			if sa.SecretType != SecretTypeAccessToken {
+				// Remove WAL entry - we don't clean keys if roleset generates key secrets.
+				return nil
+			}
+			if sa.TokenGen != nil {
+				keyInUse = sa.TokenGen.KeyName
+			}
+		}
+	default:
+		b.Logger().Error("removing invalid walAccountKey with empty RoleSet and empty StaticAccount - may need manual cleanup: %v", entry)
+		return nil
 	}
 
 	iamC, err := b.IAMAdminClient(req.Storage)
@@ -167,19 +185,36 @@ func (b *backend) serviceAccountPolicyRollback(ctx context.Context, req *logical
 		return err
 	}
 
-	// Try to verify service account not being used by roleset
-	rs, err := getRoleSet(entry.RoleSet, ctx, req.Storage)
-	if err != nil {
-		return err
+	var rolesInUse util.StringSet
+
+	switch {
+	case entry.RoleSet != "":
+		// Try to verify service account not being used by roleset
+		rs, err := getRoleSet(entry.RoleSet, ctx, req.Storage)
+		if err != nil {
+			return err
+		}
+		if rs.AccountId != nil && rs.AccountId.ResourceName() == entry.AccountId.ResourceName() {
+			rolesInUse = rs.Bindings[entry.Resource]
+		}
+	case entry.StaticAccount != "":
+		// Try to verify service account not being used by roleset
+		sa, err := getStaticAccount(entry.RoleSet, ctx, req.Storage)
+		if err != nil {
+			return err
+		}
+		if sa.ResourceName() == entry.AccountId.ResourceName() {
+			rolesInUse = sa.Bindings[entry.Resource]
+		}
+	default:
+		b.Logger().Error("removing invalid walIamPolicy with empty RoleSet and empty StaticAccount - may need manual cleanup: %v", entry)
+		return nil
 	}
 
 	// Take out any bindings still being used by this role set from roles being removed.
 	rolesToRemove := util.ToSet(entry.Roles)
-	if rs != nil && rs.AccountId.ResourceName() == entry.AccountId.ResourceName() {
-		currRoles, ok := rs.Bindings[entry.Resource]
-		if ok {
-			rolesToRemove = rolesToRemove.Sub(currRoles)
-		}
+	if len(rolesInUse) > 0 {
+		rolesToRemove = rolesToRemove.Sub(rolesInUse)
 	}
 
 	r, err := b.iamResources.Parse(entry.Resource)
@@ -193,10 +228,6 @@ func (b *backend) serviceAccountPolicyRollback(ctx context.Context, req *logical
 	}
 
 	iamHandle := iamutil.GetIamHandle(httpC, useragent.String())
-	if err != nil {
-		return err
-	}
-
 	p, err := iamHandle.GetIamPolicy(ctx, r)
 	if err != nil {
 		return err
@@ -207,66 +238,12 @@ func (b *backend) serviceAccountPolicyRollback(ctx context.Context, req *logical
 			Email: entry.AccountId.EmailOrId,
 			Roles: rolesToRemove,
 		})
-
 	if !changed {
 		return nil
 	}
 
 	_, err = iamHandle.SetIamPolicy(ctx, r, newP)
 	return err
-}
-
-func (b *backend) deleteServiceAccount(ctx context.Context, iamAdmin *iam.Service, account gcputil.ServiceAccountId) error {
-	if account.EmailOrId == "" {
-		return nil
-	}
-
-	_, err := iamAdmin.Projects.ServiceAccounts.Delete(account.ResourceName()).Do()
-	if err != nil && !isGoogleAccountNotFoundErr(err) {
-		return errwrap.Wrapf("unable to delete service account: {{err}}", err)
-	}
-	return nil
-}
-
-func (b *backend) deleteTokenGenKey(ctx context.Context, iamAdmin *iam.Service, tgen *TokenGenerator) error {
-	if tgen == nil || tgen.KeyName == "" {
-		return nil
-	}
-
-	_, err := iamAdmin.Projects.ServiceAccounts.Keys.Delete(tgen.KeyName).Do()
-	if err != nil && !isGoogleAccountKeyNotFoundErr(err) {
-		return errwrap.Wrapf("unable to delete service account key: {{err}}", err)
-	}
-	return nil
-}
-
-func (b *backend) removeBindings(ctx context.Context, iamHandle *iamutil.IamHandle, email string, bindings ResourceBindings) (allErr *multierror.Error) {
-	for resName, roles := range bindings {
-		resource, err := b.iamResources.Parse(resName)
-		if err != nil {
-			allErr = multierror.Append(allErr, errwrap.Wrapf(fmt.Sprintf("unable to delete role binding for resource '%s': {{err}}", resName), err))
-			continue
-		}
-
-		p, err := iamHandle.GetIamPolicy(ctx, resource)
-		if err != nil {
-			allErr = multierror.Append(allErr, errwrap.Wrapf(fmt.Sprintf("unable to delete role binding for resource '%s': {{err}}", resName), err))
-			continue
-		}
-
-		changed, newP := p.RemoveBindings(&iamutil.PolicyDelta{
-			Email: email,
-			Roles: roles,
-		})
-		if !changed {
-			continue
-		}
-		if _, err = iamHandle.SetIamPolicy(ctx, resource, newP); err != nil {
-			allErr = multierror.Append(allErr, errwrap.Wrapf(fmt.Sprintf("unable to delete role binding for resource '%s': {{err}}", resName), err))
-			continue
-		}
-	}
-	return
 }
 
 // This tries to clean up WALs that are no longer needed.
@@ -280,30 +257,4 @@ func (b *backend) tryDeleteWALs(ctx context.Context, s logical.Storage, walIds .
 			b.Logger().Error("unable to delete unneeded WAL %s, ignoring error since WAL will no-op: %v", walId, err)
 		}
 	}
-}
-
-func isGoogleAccountNotFoundErr(err error) bool {
-	return isGoogleApiErrorWithCodes(err, 404)
-}
-
-func isGoogleAccountKeyNotFoundErr(err error) bool {
-	return isGoogleApiErrorWithCodes(err, 403, 404)
-}
-
-func isGoogleApiErrorWithCodes(err error, validErrCodes ...int) bool {
-	if err == nil {
-		return false
-	}
-	gErr, ok := err.(*googleapi.Error)
-	if !ok {
-		return false
-	}
-
-	for _, code := range validErrCodes {
-		if gErr.Code == code {
-			return true
-		}
-	}
-
-	return false
 }
