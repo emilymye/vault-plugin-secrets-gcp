@@ -77,6 +77,8 @@ github.com/hashicorp/go-cleanhttp v0.5.1 h1:dH3aiDG9Jvb5r5+bYHsikaOUIpcM0xvgMXVo
 github.com/hashicorp/go-cleanhttp v0.5.1/go.mod h1:JpRdi6/HCYpAwUzNwuwqhbovhLtngrth3wmdIIUrZ80=
 github.com/hashicorp/go-gcp-common v0.5.0 h1:kkIQTjNTopn4eXQ1+lCiHYZXUtgIZvbc6YtAQkMnTos=
 github.com/hashicorp/go-gcp-common v0.5.0/go.mod h1:IDGUI2N/OS3PiU4qZcXJeWKPI6O/9Y8hOrbSiMcqyYw=
+github.com/hashicorp/go-gcp-common v0.6.0 h1:m1X+DK003bj4WEjqOnv+Csepb3zpfN/bidboUeUSj68=
+github.com/hashicorp/go-gcp-common v0.6.0/go.mod h1:RuZi18562/z30wxOzpjeRrGcmk9Ro/rBzixaSZDhIhY=
 github.com/hashicorp/go-hclog v0.0.0-20180709165350-ff2cf002a8dd/go.mod h1:9bjs9uLqI8l75knNv3lV1kA55veR+WUPSiKIWcQHudI=
 github.com/hashicorp/go-hclog v0.8.0 h1:z3ollgGRg8RjfJH6UVBaG54R70GFd++QOkvnJH3VSBY=
 github.com/hashicorp/go-hclog v0.8.0/go.mod h1:5CU+agLiy3J7N7QjHK5d05KxGsuXiQLrjA0H7acj2lQ=
